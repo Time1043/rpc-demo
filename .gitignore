@@ -4,6 +4,10 @@
 # Log file
 *.log
 
+# Ignore .idea directory
+**/.idea/
+**/.data/
+
 # BlueJ files
 *.ctxt
 
