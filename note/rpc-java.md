@@ -156,8 +156,19 @@
   example.common.service.UserService (interface)
   
   
+  # rpc-easy
   rpceasy.server.HttpServer (interface)
   rpceasy.server.VertxHttpServer (class)
+  
+  rpceasy.registry.LocalRegistry (class)
+  
+  rpceasy.serializer.Serializer (interface)
+  rpceasy.serializer.JdkSerializer (class)
+  
+  rpceasy.model.RpcRequest (class)
+  rpceasy.model.RpcResponse (class)
+  rpceasy.server.HttpServerHandler (class)
+  
   
   ```
   
@@ -515,6 +526,510 @@
   ```
 
   
+
+
+
+### 本地服务注册器
+
+- 区别
+
+  本地服务注册器：根据服务名获取到对应的实现类
+
+  注册中心：侧重于管理注册的服务、提供服务信息给消费者
+
+  
+
+
+
+---
+
+- 跑通流程阶段
+
+  暂时不用第三方注册中心
+
+  直接把服务注册到提供者本地
+
+- 具体实现
+
+  线程安全的 ConcurrentHashMap 存储服务注册信息 
+
+  key 为服务名称、value 为服务的实现类
+
+  根据要调用的服务名称 获取对应的实现类 然后通过反射进行方法调用
+
+- rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\registry\LocalRegistry.java
+
+  ```java
+  package com.time1043.rpceasy.registry;
+  
+  import java.util.Map;
+  import java.util.concurrent.ConcurrentHashMap;
+  
+  /**
+   * 本地注册中心
+   */
+  public class LocalRegistry {
+      /**
+       * 注册信息存储
+       */
+      private static final Map<String, Class<?>> map = new ConcurrentHashMap<>();
+  
+      /**
+       * 注册服务
+       *
+       * @param serviceName
+       * @param implClass
+       */
+      public static void register(String serviceName, Class<?> implClass) {
+          map.put(serviceName, implClass);
+      }
+  
+      /**
+       * 获取服务
+       *
+       * @param serviceName
+       * @return
+       */
+      public static Class<?> get(String serviceName) {
+          return map.get(serviceName);
+      }
+  
+      /**
+       * 删除服务
+       * 
+       * @param serviceName
+       */
+      public static void remove(String serviceName) {
+          map.remove(serviceName);
+      }
+  }
+  
+  ```
+
+- rpc-demo\example-provider\src\main\java\com\time1043\example\provider\EasyProviderExample.java
+
+  ```java
+  package com.time1043.example.provider;
+  
+  import com.time1043.example.common.service.UserService;
+  import com.time1043.rpceasy.registry.LocalRegistry;
+  import com.time1043.rpceasy.server.HttpServer;
+  import com.time1043.rpceasy.server.VertxHttpServer;
+  
+  /**
+   * 简单服务提供者示例
+   */
+  public class EasyProviderExample {
+      public static void main(String[] args) {
+          // 注册服务
+          LocalRegistry.register(UserService.class.getName(), UserServiceImpl.class);
+  
+          // 启动 web 服务
+          HttpServer httpServer = new VertxHttpServer();
+          httpServer.doStart(8080);
+      }
+  }
+  
+  ```
+
+  
+
+
+
+### 序列化器
+
+- 序列化
+
+  序列化：java对象 -> 可传输的字节数组
+
+  反序列化：字节数组 -> java对象
+
+- 实现方式
+
+  java原生序列化、json、hessian、kryo、protobuf
+
+- rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\serializer\Serializer.java
+
+  ```java
+  package com.time1043.rpceasy.serializer;
+  
+  import java.io.IOException;
+  
+  public interface Serializer {
+      /**
+       * 序列化对象
+       *
+       * @param object
+       * @return
+       * @param <T>
+       * @throws IOException
+       */
+      <T> byte[] serialize(T object) throws IOException;
+  
+      /**
+       * 反序列化对象
+       *
+       * @param bytes
+       * @param type
+       * @return
+       * @param <T>
+       * @throws IOException
+       */
+      <T> T deserialize(byte[] bytes, Class<T> type) throws IOException;
+  }
+  
+  ```
+
+- rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\serializer\JdkSerializerImpl.java
+
+  ```java
+  package com.time1043.rpceasy.serializer;
+  
+  import java.io.*;
+  
+  public class JdkSerializerImpl implements Serializer {
+      /**
+       * 序列化对象
+       *
+       * @param object
+       * @return
+       * @param <T>
+       * @throws IOException
+       */
+      @Override
+      public <T> byte[] serialize(T object) throws IOException {
+          ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+          ObjectOutputStream objectOutputStream = new ObjectOutputStream(outputStream);
+  
+          objectOutputStream.writeObject(object);
+          objectOutputStream.close();
+  
+          return outputStream.toByteArray();
+      }
+  
+      @Override
+      public <T> T deserialize(byte[] bytes, Class<T> type) throws IOException {
+          ByteArrayInputStream inputStream = new ByteArrayInputStream(bytes);
+          ObjectInputStream objectInputStream = new ObjectInputStream(inputStream);
+  
+          try {
+              return (T) objectInputStream.readObject();
+          } catch (ClassNotFoundException e) {
+              throw new RuntimeException(e);
+          } finally {
+              objectInputStream.close();
+          }
+      }
+  }
+  
+  ```
+
+  
+
+
+
+### 请求处理器 (请求者处理调用)
+
+- 概念
+
+  处理接收到的请求 并根据请求参数找到对应的服务和方法
+
+  通过反射实现调用 最后封装返回结果并响应请求
+
+  
+
+
+
+- 请求和响应的封装类
+
+  rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\model\RpcRequest.java
+
+  封装调用所需的信息 (服务名称 方法名称 调用参数的类型列表 参数列表) - java反射
+
+  ```java
+  package com.time1043.rpceasy.model;
+  
+  import lombok.AllArgsConstructor;
+  import lombok.Builder;
+  import lombok.Data;
+  import lombok.NoArgsConstructor;
+  
+  import java.io.Serializable;
+  
+  /**
+   * RPC 请求
+   */
+  @Data
+  @Builder
+  @AllArgsConstructor
+  @NoArgsConstructor
+  public class RpcRequest implements Serializable {
+      /**
+       * 服务名称
+       */
+      private String serviceName;
+  
+      /**
+       * 方法名称
+       */
+      private String methodName;
+  
+      /**
+       * 参数类型列表
+       */
+      private Class<?>[] parameterTypes;
+  
+      /**
+       * 参数列表
+       */
+      private Object[] args;
+  }
+  
+  ```
+
+- rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\model\RpcResponse.java
+
+  封装调用方法得到的返回值、以及调用的信息 (如异常情况)
+
+  ```java
+  package com.time1043.rpceasy.model;
+  
+  import lombok.AllArgsConstructor;
+  import lombok.Builder;
+  import lombok.Data;
+  import lombok.NoArgsConstructor;
+  
+  import java.io.Serializable;
+  
+  /**
+   * RPC 响应
+   */
+  @Data
+  @Builder
+  @AllArgsConstructor
+  @NoArgsConstructor
+  public class RpcResponse implements Serializable {
+      /**
+       * 响应数据
+       */
+      private Object data;
+  
+      /**
+       * 响应数据类型 (预留)
+       */
+      private Class<?> dataType;
+  
+      /**
+       * 响应信息
+       */
+      private String message;
+  
+      /**
+       * 异常信息
+       */
+      private Exception exception;
+  }
+  
+  ```
+
+  
+
+
+
+---
+
+- 请求处理器
+
+  rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\server\HttpServerHandler.java
+
+  反序列化请求对象，并从请求对象中获取参数
+
+  根据服务名称从本地注册器中获取到对应的 服务实现类
+
+  通过反射机制调用方法，得到返回结果
+
+  对返回结果进行封装和序列化，并写入到响应中
+
+  ```java
+  package com.time1043.rpceasy.server;
+  
+  import com.time1043.rpceasy.model.RpcRequest;
+  import com.time1043.rpceasy.model.RpcResponse;
+  import com.time1043.rpceasy.registry.LocalRegistry;
+  import com.time1043.rpceasy.serializer.JdkSerializer;
+  import com.time1043.rpceasy.serializer.Serializer;
+  import io.vertx.core.Handler;
+  import io.vertx.core.buffer.Buffer;
+  import io.vertx.core.http.HttpServerRequest;
+  import io.vertx.core.http.HttpServerResponse;
+  
+  import java.lang.reflect.Method;
+  
+  /**
+   * HTTP 请求处理
+   */
+  public class HttpServerHandler implements Handler<HttpServerRequest> {
+      @Override
+      public void handle(HttpServerRequest request) {
+          // 指定序列化器
+          final Serializer serializer = new JdkSerializer();
+  
+          // 记录日志
+          System.out.println("Received request: " + request.method() + " " + request.uri());
+  
+          // 异步处理 HTTP 请求
+          request.bodyHandler(body -> {
+              byte[] bytes = body.getBytes();
+              RpcRequest rpcRequest = null;
+  
+              try {
+                  rpcRequest = serializer.deserialize(bytes, RpcRequest.class);
+              } catch (Exception e) {
+                  e.printStackTrace();
+              }
+  
+              // 构造响应结果对象
+              RpcResponse rpcResponse = new RpcResponse();
+              // 若请求为null 直接返回
+              if (rpcRequest == null) {
+                  rpcResponse.setMessage("rpcRequest is null");
+                  doResponse(request, rpcResponse, serializer);
+                  return;
+              }
+  
+              try {
+                  // 获取要调用的服务实现类 通过反射调用
+                  Class<?> implClass = LocalRegistry.get(rpcRequest.getServiceName());
+                  Method method = implClass.getMethod(rpcRequest.getMethodName(), rpcRequest.getParameterTypes());
+                  Object result = method.invoke(implClass.newInstance(), rpcRequest.getArgs());
+                  // 封装返回结果
+                  rpcResponse.setData(result);
+                  rpcResponse.setDataType(method.getReturnType());
+                  rpcResponse.setMessage("ok");
+              } catch (Exception e) {
+                  e.printStackTrace();
+                  rpcResponse.setMessage(e.getMessage());
+                  rpcResponse.setException(e);
+              }
+  
+              // 响应
+              doResponse(request, rpcResponse, serializer);
+          });
+      }
+  
+      /**
+       * 响应
+       *
+       * @param request
+       * @param rpcResponse
+       * @param serializer
+       */
+      void doResponse(HttpServerRequest request, RpcResponse rpcResponse, Serializer serializer) {
+          HttpServerResponse httpServerResponse = request.response()
+                  .putHeader("Content-Type", "application/json");
+          try {
+              // 序列化
+              byte[] serialized = serializer.serialize(rpcResponse);
+              httpServerResponse.end(Buffer.buffer(serialized));
+          } catch (Exception e) {
+              e.printStackTrace();
+              httpServerResponse.end(Buffer.buffer());
+          }
+      }
+  }
+  
+  ```
+
+- 注意
+
+  不同的web服务器对应的请求处理器的实现方式不同
+
+  vert.x 通过实现 `Handler<HttpServerRequest>`  接口来自定义请求处理器，并且可以通过 `request.bodyHandler` 异步处理请求
+
+  
+
+
+
+---
+
+- 给 HttpServer 绑定请求处理器
+
+  rpc-demo\rpc-easy\src\main\java\com\time1043\rpceasy\server\VertxHttpServer.java
+
+  ```java
+  package com.time1043.rpceasy.server;
+  
+  import io.vertx.core.Vertx;
+  
+  /**
+   * Vert.x 实现的 HTTP 服务器
+   */
+  public class VertxHttpServer implements HttpServer {
+      /**
+       * 启动 HTTP 服务器
+       * 
+       * @param port
+       */
+      @Override
+      public void doStart(int port) {
+          // 创建 Vert.x 实例
+          Vertx vertx = Vertx.vertx();
+          // 创建 HTTP 服务器
+          io.vertx.core.http.HttpServer server = vertx.createHttpServer();
+  
+          // 监听端口并处理请求
+          server.requestHandler(new HttpServerHandler());
+  
+          // 启动 HTTP 服务器 并监听指定端口
+          server.listen(port, result -> {
+              if (result.succeeded()) {
+                  System.out.println("Server is now listening on port " + port);
+              } else {
+                  System.out.println("Failed to start server: " + result.cause());
+              }
+          });
+      }
+  }
+  
+  ```
+
+  
+
+
+
+### 消费方发起调用 - 代理
+
+- UserService对象 (实现类) 从何而来
+
+  UserServiceImpl
+
+  代理对象 简化消费方的调用 (静态代理 动态代码)
+
+- 静态代理 (麻烦 灵活性差)
+
+  为每一个特定的类型的接口或对象 编写一个代理类
+
+- 动态代理 
+
+  根据要生成对象的类型，自动生成一个代理对象
+
+  实现方式：JDK动态代理、基于字节码生成的动态代理 (如CGLIB)
+
+  
+
+
+
+
+
+
+
+### 测试验证
+
+
+
+
+
+
 
 
 
